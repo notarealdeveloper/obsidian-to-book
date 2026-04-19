@@ -1,0 +1,13 @@
+from: markdown+smart
+standalone: true
+pdf-engine: lualatex
+number-sections: true
+top-level-division: chapter
+resource-path:
+  - .
+template: template.tex
+filters:
+  - images.lua
+include-in-header:
+  - fonts.tex
+  - images.tex

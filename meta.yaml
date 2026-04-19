@@ -1,0 +1,28 @@
+title: "We"
+subtitle: ""
+author: "The Nameless"
+date: ""
+lang: english
+documentclass: book
+classoption:
+  - openany
+fontsize: 10pt
+mainfont: Libertinus Serif
+sansfont: Libertinus Sans
+monofont: Libertinus Mono
+geometry:
+  - paperwidth=6.5in
+  - paperheight=9.5in
+  - inner=0.9in
+  - outer=0.8in
+  - top=0.9in
+  - bottom=0.9in
+linestretch: 1.08
+colorlinks: true
+linkcolor: blue
+urlcolor: blue
+toc: true
+toc-depth: 2
+lof: false
+lot: false
+secnumdepth: 3

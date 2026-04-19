@@ -1,0 +1,480 @@
+#!/usr/bin/env python
+
+import argparse
+import re
+import shutil
+import sys
+from pathlib import Path
+from typing import Iterable
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".tif", ".tiff"}
+NOTE_EXT = ".md"
+
+WIKILINK_RE = re.compile(r'(!)?\[\[([^\]]+)\]\]')
+
+
+# ============================================================
+# Pure step functions
+# ============================================================
+
+def step1_normalize_obsidian_ref(raw: str) -> str:
+    """
+    Normalize a single Obsidian-style reference.
+
+    Accepts any of:
+        [[Note]]
+        [[Note|Alias]]
+        [[Note#Heading]]
+        [[Note#Heading|Alias]]
+        ![[image.png]]
+        ![[image.png|300]]
+
+    Returns the target part only, stripped of:
+        - outer ![[ ]]
+        - alias / size after |
+        - subpath after #
+        - surrounding whitespace
+
+    Examples:
+        '[[Foo Bar]]'              -> 'Foo Bar'
+        '![[img/test.png|300]]'    -> 'img/test.png'
+        '[[Note#Section|Alias]]'   -> 'Note'
+    """
+    s = raw.strip()
+
+    if s.startswith("![[") and s.endswith("]]"):
+        s = s[3:-2]
+    elif s.startswith("[[") and s.endswith("]]"):
+        s = s[2:-2]
+
+    if "|" in s:
+        s = s.split("|", 1)[0]
+
+    if "#" in s:
+        s = s.split("#", 1)[0]
+
+    return s.strip()
+
+
+def step2_extract_image_refs(md_text: str) -> list[str]:
+    """
+    Extract normalized image references from an Obsidian markdown string.
+
+    Only returns refs from ![[...]], not plain [[...]].
+
+    Example:
+        'hello ![[foo.png]] and ![[bar.jpg|200]]'
+        -> ['foo.png', 'bar.jpg']
+    """
+    out: list[str] = []
+
+    for bang, body in WIKILINK_RE.findall(md_text):
+        if bang == "!":
+            out.append(step1_normalize_obsidian_ref(body))
+
+    return out
+
+
+def step3_rewrite_obsidian_images_to_pandoc(md_text: str, img_prefix: str = "book/img") -> str:
+    """
+    Rewrite Obsidian image embeds in markdown into Pandoc-style image refs.
+
+    Only rewrites ![[...]].
+    Leaves plain [[...]] unchanged.
+
+    Example:
+        '![[foo/bar.png|300]]' -> '![](book/img/bar.png)'
+    """
+    def repl(match: re.Match[str]) -> str:
+        bang = match.group(1)
+        body = match.group(2)
+
+        if bang != "!":
+            return match.group(0)
+
+        target = step1_normalize_obsidian_ref(body)
+        basename = Path(target).name
+        return f"![]({img_prefix}/{basename})"
+
+    return WIKILINK_RE.sub(repl, md_text)
+
+
+def step4_resolve_vault_target(
+    vault_root: Path,
+    target: str,
+    allowed_exts: set[str],
+    referring_path: Path | None = None,
+) -> tuple[Path | None, list[Path]]:
+    """
+    Resolve a normalized target inside a vault.
+
+    Search strategy:
+      1. If target clearly looks like a vault-relative path
+         (contains '/' or starts with './'), and exists, return it immediately.
+      2. Otherwise search by exact basename if target has suffix.
+      3. Otherwise search by stem.
+      4. If multiple matches:
+           - prefer same directory as referring_path if exactly one
+           - otherwise return ambiguous candidates
+
+    Returns:
+        (resolved_path, all_candidates)
+
+    If ambiguous or missing, resolved_path is None.
+    """
+    vault_root = vault_root.resolve()
+    target = target.strip()
+    target_path = normalize_vault_relative_target(target)
+
+    # Only explicit path-like inputs get exact vault-relative treatment.
+    if looks_like_explicit_vault_relative_path(target):
+        exact = (vault_root / target_path).resolve()
+        if exact.is_file() and exact.suffix.lower() in allowed_exts:
+            return exact, [exact]
+
+    candidates: list[Path] = []
+
+    for p in vault_root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in allowed_exts:
+            continue
+
+        if target_path.suffix:
+            if p.name == target_path.name:
+                candidates.append(p.resolve())
+        else:
+            if p.stem == target_path.name:
+                candidates.append(p.resolve())
+
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for p in candidates:
+        if p not in seen:
+            deduped.append(p)
+            seen.add(p)
+
+    candidates = deduped
+
+    if not candidates:
+        return None, []
+
+    if len(candidates) == 1:
+        return candidates[0], candidates
+
+    if referring_path is not None:
+        referring_dir = referring_path.resolve().parent
+        same_dir = [p for p in candidates if p.parent == referring_dir]
+        if len(same_dir) == 1:
+            return same_dir[0], candidates
+
+    return None, candidates
+
+
+def step5_copy_file(src: Path, dst: Path) -> None:
+    """
+    Copy one file to one destination path, creating parent directories.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+# ============================================================
+# Helper functions for orchestration
+# ============================================================
+
+def looks_like_explicit_vault_relative_path(target: str) -> bool:
+    """
+    True only if the user clearly supplied path structure.
+
+    Examples:
+        "./README.md"              -> True
+        "fs/README.md"             -> True
+        "arch/x/README.md"         -> True
+        "README.md"                -> False
+        "README"                   -> False
+    """
+    target = target.strip()
+    return "/" in target or target.startswith("./")
+
+def normalize_vault_relative_target(target: str) -> Path:
+    """
+    Normalize a user-supplied vault-relative path without requiring it to exist.
+
+    Examples:
+        "./README.md"   -> Path("README.md")
+        "fs/README.md"  -> Path("fs/README.md")
+        "a/../b.md"     -> Path("b.md")
+    """
+    parts = []
+    for part in Path(target).parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    if not parts:
+        return Path(".")
+    return Path(*parts)
+
+def read_requested_files(args: argparse.Namespace) -> list[str]:
+    """
+    Read file names from positional args, or from stdin one per line if absent.
+    """
+    if args.files:
+        return [x.strip() for x in args.files if x.strip()]
+    return [line.strip() for line in sys.stdin if line.strip()]
+
+
+def stage_from_args(args: argparse.Namespace) -> int:
+    """
+    Flags are cumulative:
+      -1 => stage 1
+      -2 => stage 2
+      -3 => stage 3
+      -4 => stage 4
+      -5 => stage 5
+    Highest selected stage wins.
+    """
+    stage = 0
+    if args.list_files:
+        stage = max(stage, 1)
+    if args.copy_files:
+        stage = max(stage, 2)
+    if args.list_images:
+        stage = max(stage, 3)
+    if args.copy_images:
+        stage = max(stage, 4)
+    if args.rewrite_files:
+        stage = max(stage, 5)
+    return stage
+
+
+def fmt_candidates(paths: Iterable[Path]) -> str:
+    return "\n".join(f"    {p}" for p in paths)
+
+
+def resolve_note(vault_root: Path, note_ref: str) -> tuple[Path | None, list[Path]]:
+    """
+    Resolve one note name/ref to a markdown file under the vault.
+    """
+    target = step1_normalize_obsidian_ref(note_ref)
+    return step4_resolve_vault_target(vault_root, target, {NOTE_EXT}, referring_path=None)
+
+
+def resolve_image(vault_root: Path, image_ref: str, referring_md_src: Path) -> tuple[Path | None, list[Path]]:
+    """
+    Resolve one image ref to an image file under the vault.
+    """
+    target = step1_normalize_obsidian_ref(image_ref)
+    return step4_resolve_vault_target(vault_root, target, IMAGE_EXTS, referring_path=referring_md_src)
+
+
+def local_md_path(output_root: Path, src_md: Path) -> Path:
+    return output_root / "md" / src_md.name
+
+
+def local_img_path(output_root: Path, src_img: Path) -> Path:
+    return output_root / "img" / src_img.name
+
+
+# ============================================================
+# Main orchestration
+# ============================================================
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument(
+        "files",
+        nargs="*",
+        help="Names of markdown files in desired book order. If absent, read one per line from stdin.",
+    )
+
+    ap.add_argument(
+        "-i", "--input",
+        required=True,
+        help="Path to Obsidian vault.",
+    )
+
+    ap.add_argument(
+        "-o", "--output",
+        default="book",
+        help="Path to book directory. Default: book",
+    )
+
+    ap.add_argument(
+        "-1", "--list-files",
+        action="store_true",
+        help="Print paths to markdown files found or not found in the input directory.",
+    )
+
+    ap.add_argument(
+        "-2", "--copy-files",
+        action="store_true",
+        help="Copy markdown files into $output/md.",
+    )
+
+    ap.add_argument(
+        "-3", "--list-images",
+        action="store_true",
+        help="Print paths to image files found or not found in the input directory.",
+    )
+
+    ap.add_argument(
+        "-4", "--copy-images",
+        action="store_true",
+        help="Copy image files into $output/img.",
+    )
+
+    ap.add_argument(
+        "-5", "--rewrite-files",
+        action="store_true",
+        help="Rewrite markdown files in $output/md to point to images in $output/img.",
+    )
+
+    args = ap.parse_args()
+
+    stage = stage_from_args(args)
+    if stage == 0:
+        ap.error("select at least one of -1, -2, -3, -4, -5")
+
+    vault_root = Path(args.input).expanduser().resolve()
+    output_root = Path(args.output).expanduser().resolve()
+
+    if not vault_root.is_dir():
+        print(f"error: input vault does not exist or is not a directory: {vault_root}", file=sys.stderr)
+        return 2
+
+    requested = read_requested_files(args)
+    if not requested:
+        print("error: no file names provided", file=sys.stderr)
+        return 2
+
+    # --------------------------------------------------------
+    # Step 1: resolve requested markdown files
+    # --------------------------------------------------------
+    found_notes: list[tuple[str, Path]] = []
+    missing_notes: list[str] = []
+    ambiguous_notes: list[tuple[str, list[Path]]] = []
+
+    for note_ref in requested:
+        resolved, candidates = resolve_note(vault_root, note_ref)
+        if resolved is not None:
+            found_notes.append((note_ref, resolved))
+        elif not candidates:
+            missing_notes.append(note_ref)
+        else:
+            ambiguous_notes.append((note_ref, candidates))
+
+    if stage >= 1:
+        print("FOUND MARKDOWN FILES:")
+        for original, path in found_notes:
+            print(f"  {original} -> {path}")
+
+        if missing_notes:
+            print("\nMISSING MARKDOWN FILES:")
+            for x in missing_notes:
+                print(f"  {x}")
+
+        if ambiguous_notes:
+            print("\nAMBIGUOUS MARKDOWN FILES:")
+            for original, candidates in ambiguous_notes:
+                print(f"  {original}")
+                print(fmt_candidates(candidates))
+
+    if missing_notes or ambiguous_notes:
+        print(
+            "\nerror: cannot proceed because some markdown files were missing or ambiguous",
+            file=sys.stderr,
+        )
+        return 1
+
+    # --------------------------------------------------------
+    # Step 2: copy markdown files
+    # --------------------------------------------------------
+    if stage >= 2:
+        for _, src_md in found_notes:
+            dst_md = local_md_path(output_root, src_md)
+            step5_copy_file(src_md, dst_md)
+
+    # --------------------------------------------------------
+    # Step 3: extract and resolve images
+    # --------------------------------------------------------
+    found_images: list[tuple[Path, str, Path]] = []
+    missing_images: list[tuple[Path, str]] = []
+    ambiguous_images: list[tuple[Path, str, list[Path]]] = []
+
+    if stage >= 3:
+        for _, src_md in found_notes:
+            md_text = src_md.read_text(encoding="utf-8")
+            image_refs = step2_extract_image_refs(md_text)
+
+            for image_ref in image_refs:
+                resolved_img, candidates = resolve_image(vault_root, image_ref, src_md)
+                if resolved_img is not None:
+                    found_images.append((src_md, image_ref, resolved_img))
+                elif not candidates:
+                    missing_images.append((src_md, image_ref))
+                else:
+                    ambiguous_images.append((src_md, image_ref, candidates))
+
+        print("FOUND IMAGE FILES:")
+        for src_md, image_ref, img_path in found_images:
+            print(f"  {src_md} :: {image_ref} -> {img_path}")
+
+        if missing_images:
+            print("\nMISSING IMAGE FILES:")
+            for src_md, image_ref in missing_images:
+                print(f"  {src_md} :: {image_ref}")
+
+        if ambiguous_images:
+            print("\nAMBIGUOUS IMAGE FILES:")
+            for src_md, image_ref, candidates in ambiguous_images:
+                print(f"  {src_md} :: {image_ref}")
+                print(fmt_candidates(candidates))
+
+    if stage >= 3 and (missing_images or ambiguous_images):
+        print(
+            "\nerror: cannot proceed because some image files were missing or ambiguous",
+            file=sys.stderr,
+        )
+        return 1
+
+    # --------------------------------------------------------
+    # Step 4: copy images
+    # --------------------------------------------------------
+    if stage >= 4:
+        copied: set[Path] = set()
+        for _, _, src_img in found_images:
+            if src_img in copied:
+                continue
+            dst_img = local_img_path(output_root, src_img)
+            step5_copy_file(src_img, dst_img)
+            copied.add(src_img)
+
+    # --------------------------------------------------------
+    # Step 5: rewrite copied markdown files
+    # --------------------------------------------------------
+    if stage >= 5:
+        for _, src_md in found_notes:
+            dst_md = local_md_path(output_root, src_md)
+            if not dst_md.exists():
+                print(f"error: expected copied markdown file missing: {dst_md}", file=sys.stderr)
+                return 1
+
+            old_text = dst_md.read_text(encoding="utf-8")
+            new_text = step3_rewrite_obsidian_images_to_pandoc(
+                old_text,
+                img_prefix="book/img",
+            )
+            dst_md.write_text(new_text, encoding="utf-8")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
