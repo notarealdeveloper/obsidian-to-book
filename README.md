@@ -10,6 +10,6 @@ cat toc.txt | ./obsidian-to-book -5 -i $OBSIDIAN/We
 
 ## Create book pdf from book directory
 
-``sh
+```sh
 make
-``
+```
